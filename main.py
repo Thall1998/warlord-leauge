@@ -1,4 +1,5 @@
 import base64
+import calendar
 import hashlib
 import hmac
 import json
@@ -9,7 +10,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import webserver
 
@@ -24,6 +25,12 @@ FACTIONS = ("Devernian Empire", "Dwavern Forges", "Elven Branches", "Free Kingdo
 POINTS_PER_WIN = 1
 WEEKLY_BOUNTY_BONUS = 2
 META_KEY = "__meta__"
+LEAGUE_CATEGORY_ORDER = (
+    ("Most games played", "games"),
+    ("Most wins", "wins"),
+    ("Most unique players played", "unique_opponents"),
+    ("Most losses", "losses"),
+)
 
 
 def _require_data_secret():
@@ -123,11 +130,180 @@ def current_week_key():
     return f"{year}-W{week:02d}"
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def to_iso(value):
+    return value.isoformat()
+
+
+def from_iso(value):
+    return datetime.fromisoformat(value)
+
+
+def add_one_month(value):
+    year = value.year
+    month = value.month + 1
+
+    if month == 13:
+        year += 1
+        month = 1
+
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def format_discord_time(value):
+    return f"<t:{int(value.timestamp())}:F>"
+
+
 def get_meta_record():
     if META_KEY not in records:
         records[META_KEY] = {}
 
     return records[META_KEY]
+
+
+def get_active_league():
+    league = get_meta_record().get("league")
+
+    if not league or not league.get("active"):
+        return None
+
+    return league
+
+
+def get_league_player(league, player):
+    player_id = str(player.id)
+    players = league.setdefault("players", {})
+
+    if player_id not in players:
+        players[player_id] = {
+            "wins": 0,
+            "losses": 0,
+            "opponents": [],
+        }
+
+    return players[player_id]
+
+
+def record_league_match(winner, loser):
+    league = get_active_league()
+
+    if league is None:
+        return
+
+    winner_stats = get_league_player(league, winner)
+    loser_stats = get_league_player(league, loser)
+    winner_id = str(winner.id)
+    loser_id = str(loser.id)
+
+    winner_stats["wins"] += 1
+    loser_stats["losses"] += 1
+
+    if loser_id not in winner_stats["opponents"]:
+        winner_stats["opponents"].append(loser_id)
+
+    if winner_id not in loser_stats["opponents"]:
+        loser_stats["opponents"].append(winner_id)
+
+
+def league_player_value(player_stats, category_key):
+    if category_key == "games":
+        return player_stats.get("wins", 0) + player_stats.get("losses", 0)
+
+    if category_key == "unique_opponents":
+        return len(player_stats.get("opponents", []))
+
+    return player_stats.get(category_key, 0)
+
+
+def get_league_winners(league):
+    winners = []
+    used_player_ids = set()
+    players = league.get("players", {})
+
+    for category_name, category_key in LEAGUE_CATEGORY_ORDER:
+        eligible_players = [
+            (player_id, player_stats)
+            for player_id, player_stats in players.items()
+            if player_id not in used_player_ids
+        ]
+        eligible_players = [
+            (player_id, player_stats)
+            for player_id, player_stats in eligible_players
+            if league_player_value(player_stats, category_key) > 0
+        ]
+
+        if not eligible_players:
+            winners.append((category_name, None, 0))
+            continue
+
+        player_id, player_stats = max(
+            eligible_players,
+            key=lambda item: (
+                league_player_value(item[1], category_key),
+                league_player_value(item[1], "games"),
+                league_player_value(item[1], "wins"),
+                league_player_value(item[1], "unique_opponents"),
+                league_player_value(item[1], "losses"),
+                -int(item[0]),
+            ),
+        )
+        used_player_ids.add(player_id)
+        winners.append((category_name, player_id, league_player_value(player_stats, category_key)))
+
+    return winners
+
+
+def build_league_results_message(league):
+    started_at = from_iso(league["started_at"])
+    ended_at = from_iso(league["ended_at"])
+    winners = get_league_winners(league)
+    result_lines = []
+
+    for category_name, player_id, value in winners:
+        if player_id is None:
+            result_lines.append(f"{category_name}: No winner")
+        else:
+            result_lines.append(f"{category_name}: <@{player_id}> ({value})")
+
+    return (
+        "**Warlord League results**\n"
+        f"League ran from {format_discord_time(started_at)} to "
+        f"{format_discord_time(ended_at)}.\n"
+        + "\n".join(result_lines)
+    )
+
+
+async def end_league(channel):
+    league = get_active_league()
+
+    if league is None:
+        return False
+
+    league["active"] = False
+    league["ended_at"] = to_iso(utc_now())
+    get_meta_record().setdefault("league_history", []).append(league.copy())
+    save_records(records)
+
+    await channel.send(build_league_results_message(league))
+    return True
+
+
+async def end_expired_league(fallback_channel=None):
+    league = get_active_league()
+
+    if league is None or utc_now() < from_iso(league["ends_at"]):
+        return False
+
+    channel = bot.get_channel(int(league["channel_id"])) or fallback_channel
+
+    if channel is None:
+        channel = await bot.fetch_channel(int(league["channel_id"]))
+
+    return await end_league(channel)
 
 
 def get_weekly_bounty():
@@ -172,6 +348,22 @@ records = load_records()
 async def on_ready():
     print(f"We are ready to go {bot.user.name}")
 
+    if not league_end_checker.is_running():
+        league_end_checker.start()
+
+
+@tasks.loop(minutes=30)
+async def league_end_checker():
+    try:
+        await end_expired_league()
+    except Exception:
+        logging.exception("Failed to end expired league")
+
+
+@league_end_checker.before_loop
+async def before_league_end_checker():
+    await bot.wait_until_ready()
+
 
 @bot.event
 async def on_member_join(member):
@@ -189,6 +381,8 @@ async def on_message(message):
 # winner function
 @bot.command(name="winvs", aliases=["win", "win_vs"])
 async def winvs(ctx, winner: discord.Member, loser: discord.Member):
+    await end_expired_league(ctx.channel)
+
     if winner.id == loser.id:
         await ctx.send("A player cannot win against themselves.")
         return
@@ -204,6 +398,7 @@ async def winvs(ctx, winner: discord.Member, loser: discord.Member):
     winner_record["wins"] += 1
     loser_record["losses"] += 1
     winner_record["points"] += POINTS_PER_WIN
+    record_league_match(winner, loser)
 
     bounty_message = ""
     if loser_record["faction"] == bounty["faction"]:
@@ -240,6 +435,72 @@ async def record(ctx, player: discord.Member = None):
         f"{wins}W - {losses}L ({win_rate}% win rate), "
         f"{points} points, {faction}"
     )
+
+
+@bot.command(name="beginleague", aliases=["startleague"])
+async def begin_league(ctx):
+    await end_expired_league(ctx.channel)
+
+    if get_active_league() is not None:
+        league = get_active_league()
+        await ctx.send(
+            "A league is already running. It ends "
+            f"{format_discord_time(from_iso(league['ends_at']))}."
+        )
+        return
+
+    started_at = utc_now()
+    ends_at = add_one_month(started_at)
+    get_meta_record()["league"] = {
+        "active": True,
+        "started_at": to_iso(started_at),
+        "ends_at": to_iso(ends_at),
+        "ended_at": None,
+        "channel_id": str(ctx.channel.id),
+        "guild_id": str(ctx.guild.id) if ctx.guild else None,
+        "players": {},
+    }
+    save_records(records)
+
+    await ctx.send(
+        "**Warlord League started.**\n"
+        f"It will automatically end {format_discord_time(ends_at)}.\n"
+        "Categories: Most games played, most wins, most unique players played, most losses. "
+        "Each category will have a different winner."
+    )
+
+
+@bot.command(name="leaguestatus", aliases=["league"])
+async def league_status(ctx):
+    await end_expired_league(ctx.channel)
+    league = get_active_league()
+
+    if league is None:
+        await ctx.send("No league is currently running. Start one with `!beginleague`.")
+        return
+
+    player_count = len(league.get("players", {}))
+    game_count = sum(
+        player_stats.get("wins", 0)
+        for player_stats in league.get("players", {}).values()
+    )
+
+    await ctx.send(
+        "**Current Warlord League**\n"
+        f"Started: {format_discord_time(from_iso(league['started_at']))}\n"
+        f"Ends: {format_discord_time(from_iso(league['ends_at']))}\n"
+        f"Players: {player_count}\n"
+        f"Games recorded: {game_count}"
+    )
+
+
+@bot.command(name="endleague", aliases=["finishleague"])
+async def end_league_command(ctx):
+    if get_active_league() is None:
+        await ctx.send("No league is currently running. Start one with `!beginleague`.")
+        return
+
+    await end_league(ctx.channel)
 
 
 @bot.command(name="factions", aliases=["faction"])
@@ -340,7 +601,10 @@ async def bot_help(ctx):
         "`!choosefaction <faction name>` - Choose or switch factions. Alias: `!joinfaction`.\n"
         "`!myfaction [@player]` - Show a player's faction and points.\n"
         "`!weeklybounty` or `!bounty` - Show this week's bounty faction.\n"
-        "`!factionleaderboard` or `!flb` - Show faction point totals."
+        "`!factionleaderboard` or `!flb` - Show faction point totals.\n"
+        "`!beginleague` - Start a one-month league.\n"
+        "`!endleague` - End the current league early and post results.\n"
+        "`!leaguestatus` or `!league` - Show the current league status."
     )
 
 
