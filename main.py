@@ -438,6 +438,7 @@ async def record(ctx, player: discord.Member = None):
 
 
 @bot.command(name="beginleague", aliases=["startleague"])
+@commands.has_permissions(administrator=True)
 async def begin_league(ctx):
     await end_expired_league(ctx.channel)
 
@@ -495,6 +496,7 @@ async def league_status(ctx):
 
 
 @bot.command(name="endleague", aliases=["finishleague"])
+@commands.has_permissions(administrator=True)
 async def end_league_command(ctx):
     if get_active_league() is None:
         await ctx.send("No league is currently running. Start one with `!beginleague`.")
@@ -630,6 +632,15 @@ async def record_error(ctx, error):
 async def choose_faction_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("Use this command like: `!choosefaction Ash`")
+    else:
+        raise error
+
+
+@begin_league.error
+@end_league_command.error
+async def league_admin_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Only server administrators can manage leagues.")
     else:
         raise error
 
