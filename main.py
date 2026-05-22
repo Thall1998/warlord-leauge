@@ -631,7 +631,7 @@ async def record_error(ctx, error):
 @choose_faction.error
 async def choose_faction_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Use this command like: `!choosefaction Ash`")
+        await ctx.send("Use this command like: `!choosefaction Free Kingdoms`")
     else:
         raise error
 
