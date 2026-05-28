@@ -22,7 +22,7 @@ data_secret = os.getenv("DATA_SECRET_KEY")
 records_file = Path("records.json")
 
 # Bot-wide game settings and league scoring rules.
-FACTIONS = ("Devernian Empire", "Dwavern Forges", "Elven Branches", "Free Kingdoms", "Mercenary Guilds", "Nothrog Legions")
+FACTIONS = ("Devernian Empire", "Dwarven Forges", "Elven Branches", "Free Kingdoms", "Mercenary Guilds", "Nothrog Legions")
 POINTS_PER_WIN = 1
 WEEKLY_BOUNTY_BONUS = 2
 META_KEY = "__meta__"
