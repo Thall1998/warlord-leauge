@@ -15,12 +15,13 @@ from dotenv import load_dotenv
 import webserver
 
 
-# discord token and load environment file
+# Load secrets and local settings before any record data is read.
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
 data_secret = os.getenv("DATA_SECRET_KEY")
 records_file = Path("records.json")
 
+# Bot-wide game settings and league scoring rules.
 FACTIONS = ("Devernian Empire", "Dwavern Forges", "Elven Branches", "Free Kingdoms", "Mercenary Guilds", "Nothrog Legions")
 POINTS_PER_WIN = 1
 WEEKLY_BOUNTY_BONUS = 2
@@ -34,6 +35,7 @@ LEAGUE_CATEGORY_ORDER = (
 
 
 def _require_data_secret():
+    """Return the encryption secret or stop startup with a clear error."""
     if not data_secret:
         raise RuntimeError("Missing DATA_SECRET_KEY in your .env file")
 
@@ -41,10 +43,12 @@ def _require_data_secret():
 
 
 def _derive_key(salt):
+    """Derive a stable encryption key from the configured secret and a file salt."""
     return hashlib.pbkdf2_hmac("sha256", _require_data_secret(), salt, 200_000, dklen=32)
 
 
 def _keystream(key, nonce, length):
+    """Build enough pseudo-random bytes to encrypt or decrypt the JSON payload."""
     output = bytearray()
     counter = 0
 
@@ -58,6 +62,7 @@ def _keystream(key, nonce, length):
 
 
 def _encrypt_json(data):
+    """Encrypt records before writing them to disk."""
     plaintext = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
     salt = os.urandom(16)
     nonce = os.urandom(16)
@@ -76,6 +81,7 @@ def _encrypt_json(data):
 
 
 def _decrypt_json(envelope):
+    """Verify and decrypt the saved records file."""
     salt = base64.b64decode(envelope["salt"])
     nonce = base64.b64decode(envelope["nonce"])
     ciphertext = base64.b64decode(envelope["ciphertext"])
@@ -92,6 +98,7 @@ def _decrypt_json(envelope):
 
 
 def load_records():
+    """Load the encrypted record database, or start empty on first run."""
     if not records_file.exists():
         return {}
 
@@ -100,6 +107,7 @@ def load_records():
 
 
 def save_records(records):
+    """Persist all player and league data to the encrypted record file."""
     encrypted_records = _encrypt_json(records)
 
     with records_file.open("w", encoding="utf-8") as file:
@@ -107,6 +115,7 @@ def save_records(records):
 
 
 def get_player_record(player):
+    """Return a player's record, creating default fields as needed."""
     player_id = str(player.id)
 
     if player_id not in records:
@@ -122,10 +131,12 @@ def get_player_record(player):
 
 
 def current_month_key():
+    """Use UTC month keys so faction timing is consistent across servers."""
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 def current_week_key():
+    """Return the ISO week key used to rotate weekly bounty factions."""
     year, week, _ = datetime.now(timezone.utc).isocalendar()
     return f"{year}-W{week:02d}"
 
@@ -143,6 +154,7 @@ def from_iso(value):
 
 
 def add_one_month(value):
+    """Add one calendar month while preserving the day when possible."""
     year = value.year
     month = value.month + 1
 
@@ -155,10 +167,12 @@ def add_one_month(value):
 
 
 def format_discord_time(value):
+    """Format a datetime as Discord's localized timestamp markup."""
     return f"<t:{int(value.timestamp())}:F>"
 
 
 def get_meta_record():
+    """Return the non-player metadata bucket inside records.json."""
     if META_KEY not in records:
         records[META_KEY] = {}
 
@@ -166,6 +180,7 @@ def get_meta_record():
 
 
 def get_active_league():
+    """Return the currently active league state, if one is running."""
     league = get_meta_record().get("league")
 
     if not league or not league.get("active"):
@@ -175,6 +190,7 @@ def get_active_league():
 
 
 def get_league_player(league, player):
+    """Return a player's league-only stats, creating them on first match."""
     player_id = str(player.id)
     players = league.setdefault("players", {})
 
@@ -189,6 +205,7 @@ def get_league_player(league, player):
 
 
 def record_league_match(winner, loser):
+    """Copy a completed match into the active league standings."""
     league = get_active_league()
 
     if league is None:
@@ -210,6 +227,7 @@ def record_league_match(winner, loser):
 
 
 def league_player_value(player_stats, category_key):
+    """Calculate the ranking value for a single league award category."""
     if category_key == "games":
         return player_stats.get("wins", 0) + player_stats.get("losses", 0)
 
@@ -220,11 +238,13 @@ def league_player_value(player_stats, category_key):
 
 
 def get_league_winners(league):
+    """Pick one unique winner for each league category."""
     winners = []
     used_player_ids = set()
     players = league.get("players", {})
 
     for category_name, category_key in LEAGUE_CATEGORY_ORDER:
+        # Once a player wins a category, remove them from later categories.
         eligible_players = [
             (player_id, player_stats)
             for player_id, player_stats in players.items()
@@ -242,6 +262,7 @@ def get_league_winners(league):
 
         player_id, player_stats = max(
             eligible_players,
+            # Tie breakers favor activity, then wins, then unique opponents.
             key=lambda item: (
                 league_player_value(item[1], category_key),
                 league_player_value(item[1], "games"),
@@ -258,6 +279,7 @@ def get_league_winners(league):
 
 
 def build_league_results_message(league):
+    """Build the final league summary message posted to Discord."""
     started_at = from_iso(league["started_at"])
     ended_at = from_iso(league["ended_at"])
     winners = get_league_winners(league)
@@ -278,6 +300,7 @@ def build_league_results_message(league):
 
 
 async def end_league(channel):
+    """End the active league, archive it, save records, and post results."""
     league = get_active_league()
 
     if league is None:
@@ -293,6 +316,7 @@ async def end_league(channel):
 
 
 async def end_expired_league(fallback_channel=None):
+    """Automatically close the active league once its end time has passed."""
     league = get_active_league()
 
     if league is None or utc_now() < from_iso(league["ends_at"]):
@@ -307,6 +331,7 @@ async def end_expired_league(fallback_channel=None):
 
 
 def get_weekly_bounty():
+    """Return this week's deterministic faction bounty, creating it if needed."""
     meta = get_meta_record()
     week_key = current_week_key()
     bounty = meta.get("weekly_bounty", {})
@@ -325,6 +350,7 @@ def get_weekly_bounty():
 
 
 def normalize_faction(faction_name):
+    """Match user-provided faction text to the official faction name."""
     for faction in FACTIONS:
         if faction.lower() == faction_name.lower():
             return faction
@@ -332,18 +358,18 @@ def normalize_faction(faction_name):
     return None
 
 
-# logging handler
+# Configure Discord logging and privileged intents.
 handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-# command prefix
+# Create the bot and load encrypted records before commands begin running.
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 records = load_records()
 
 
-# bot event
+# Discord lifecycle and background task handlers.
 @bot.event
 async def on_ready():
     print(f"We are ready to go {bot.user.name}")
@@ -372,15 +398,17 @@ async def on_member_join(member):
 
 @bot.event
 async def on_message(message):
+    # Ignore this bot's own messages, then let discord.py route commands.
     if message.author == bot.user:
         return
 
     await bot.process_commands(message)
 
 
-# winner function
+# Player record commands.
 @bot.command(name="winvs", aliases=["win", "win_vs"])
 async def winvs(ctx, winner: discord.Member, loser: discord.Member):
+    """Record a win, award points, and update league standings if active."""
     await end_expired_league(ctx.channel)
 
     if winner.id == loser.id:
@@ -402,6 +430,7 @@ async def winvs(ctx, winner: discord.Member, loser: discord.Member):
 
     bounty_message = ""
     if loser_record["faction"] == bounty["faction"]:
+        # The bounty rewards defeating the faction selected for the current week.
         winner_record["points"] += bounty["bonus"]
         bounty_message = (
             f"\nWeekly bounty bonus: +{bounty['bonus']} points "
@@ -421,6 +450,7 @@ async def winvs(ctx, winner: discord.Member, loser: discord.Member):
 
 @bot.command()
 async def record(ctx, player: discord.Member = None):
+    """Show a player's all-time record, points, and current faction."""
     player = player or ctx.author
     player_record = get_player_record(player)
     wins = player_record["wins"]
@@ -440,6 +470,7 @@ async def record(ctx, player: discord.Member = None):
 @bot.command(name="beginleague", aliases=["startleague"])
 @commands.has_permissions(administrator=True)
 async def begin_league(ctx):
+    """Start a one-month league in the current channel."""
     await end_expired_league(ctx.channel)
 
     if get_active_league() is not None:
@@ -473,6 +504,7 @@ async def begin_league(ctx):
 
 @bot.command(name="leaguestatus", aliases=["league"])
 async def league_status(ctx):
+    """Show the current league's timing, player count, and game count."""
     await end_expired_league(ctx.channel)
     league = get_active_league()
 
@@ -498,6 +530,7 @@ async def league_status(ctx):
 @bot.command(name="endleague", aliases=["finishleague"])
 @commands.has_permissions(administrator=True)
 async def end_league_command(ctx):
+    """Allow an administrator to end the current league early."""
     if get_active_league() is None:
         await ctx.send("No league is currently running. Start one with `!beginleague`.")
         return
@@ -507,11 +540,13 @@ async def end_league_command(ctx):
 
 @bot.command(name="factions", aliases=["faction"])
 async def factions(ctx):
+    """List all factions players can choose from."""
     await ctx.send("Available factions: " + ", ".join(FACTIONS))
 
 
 @bot.command(name="choosefaction", aliases=["joinfaction"])
 async def choose_faction(ctx, *, faction_name: str):
+    """Choose a faction, or switch factions by spending current points."""
     faction = normalize_faction(faction_name)
 
     if faction is None:
@@ -548,6 +583,7 @@ async def choose_faction(ctx, *, faction_name: str):
 
 @bot.command(name="myfaction")
 async def my_faction(ctx, player: discord.Member = None):
+    """Show a player's faction and faction points."""
     player = player or ctx.author
     player_record = get_player_record(player)
     faction = player_record["faction"]
@@ -564,6 +600,7 @@ async def my_faction(ctx, player: discord.Member = None):
 
 @bot.command(name="weeklybounty", aliases=["bounty"])
 async def weekly_bounty(ctx):
+    """Show the faction that grants bonus points this week."""
     bounty = get_weekly_bounty()
     await ctx.send(
         f"This week's bounty faction is {bounty['faction']} "
@@ -572,8 +609,35 @@ async def weekly_bounty(ctx):
     )
 
 
+@bot.command(name="choosebounty", aliases=["createbounty"])
+@commands.has_permissions(administrator=True)
+async def choose_bounty(ctx, *, faction_name: str):
+    """Allow an administrator to choose this week's bounty faction."""
+    faction = normalize_faction(faction_name)
+
+    if faction is None:
+        await ctx.send(
+            "That faction does not exist. Available factions: " + ", ".join(FACTIONS)
+        )
+        return
+
+    bounty = {
+        "week": current_week_key(),
+        "faction": faction,
+        "bonus": WEEKLY_BOUNTY_BONUS,
+    }
+    get_meta_record()["weekly_bounty"] = bounty
+    save_records(records)
+
+    await ctx.send(
+        f"This week's bounty faction is now {faction}. "
+        f"Beat a member of this faction to earn +{bounty['bonus']} bonus points."
+    )
+
+
 @bot.command(name="factionleaderboard", aliases=["flb"])
 async def faction_leaderboard(ctx):
+    """Rank factions by their members' current points."""
     faction_points = {faction: 0 for faction in FACTIONS}
 
     for player_id, player_record in records.items():
@@ -594,6 +658,7 @@ async def faction_leaderboard(ctx):
 
 @bot.command(name="help")
 async def bot_help(ctx):
+    """Send a compact command reference."""
     await ctx.send(
         "**Warlord League commands**\n"
         "`!help` - Show this command list.\n"
@@ -603,6 +668,7 @@ async def bot_help(ctx):
         "`!choosefaction <faction name>` - Choose or switch factions. Alias: `!joinfaction`.\n"
         "`!myfaction [@player]` - Show a player's faction and points.\n"
         "`!weeklybounty` or `!bounty` - Show this week's bounty faction.\n"
+        "`!choosebounty <faction name>` - Admin: choose this week's bounty faction.\n"
         "`!factionleaderboard` or `!flb` - Show faction point totals.\n"
         "`!beginleague` - Start a one-month league.\n"
         "`!endleague` - End the current league early and post results.\n"
@@ -612,6 +678,7 @@ async def bot_help(ctx):
 
 @winvs.error
 async def winvs_error(ctx, error):
+    """Give users a helpful message when win recording arguments are wrong."""
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("Use this command like: `!winvs @winner @loser`")
     elif isinstance(error, commands.MemberNotFound):
@@ -622,6 +689,7 @@ async def winvs_error(ctx, error):
 
 @record.error
 async def record_error(ctx, error):
+    """Handle bad player mentions for the record command."""
     if isinstance(error, commands.MemberNotFound):
         await ctx.send("I could not find that player. Use an @mention or run `!record`.")
     else:
@@ -630,6 +698,7 @@ async def record_error(ctx, error):
 
 @choose_faction.error
 async def choose_faction_error(ctx, error):
+    """Explain the faction command format when the name is missing."""
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("Use this command like: `!choosefaction Free Kingdoms`")
     else:
@@ -638,11 +707,16 @@ async def choose_faction_error(ctx, error):
 
 @begin_league.error
 @end_league_command.error
+@choose_bounty.error
 async def league_admin_error(ctx, error):
+    """Explain that league management commands require administrator rights."""
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("Only server administrators can manage leagues.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Use this command like: `!choosebounty Free Kingdoms`")
     else:
         raise error
 
+# Start the lightweight health web server, then connect the Discord bot.
 webserver.keep_alive()
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
