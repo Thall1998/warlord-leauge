@@ -190,7 +190,7 @@ def get_active_league():
 
 
 def get_league_player(league, player):
-    """Return a player's league-only stats, creating them on first match."""
+    """Return a player's league-only stats, creating them on faction choice."""
     player_id = str(player.id)
     players = league.setdefault("players", {})
 
@@ -201,7 +201,19 @@ def get_league_player(league, player):
             "opponents": [],
         }
 
+    players[player_id]["joined_by_faction"] = True
     return players[player_id]
+
+
+def is_joined_league_player(player_stats):
+    """Return whether league stats belong to someone who joined by choosing a faction."""
+    return player_stats.get("joined_by_faction", False)
+
+
+def is_league_player(league, player):
+    """Return whether a player has joined the active league by choosing a faction."""
+    player_stats = league.get("players", {}).get(str(player.id))
+    return player_stats is not None and is_joined_league_player(player_stats)
 
 
 def record_league_match(winner, loser):
@@ -209,7 +221,10 @@ def record_league_match(winner, loser):
     league = get_active_league()
 
     if league is None:
-        return
+        return False
+
+    if not is_league_player(league, winner) or not is_league_player(league, loser):
+        return False
 
     winner_stats = get_league_player(league, winner)
     loser_stats = get_league_player(league, loser)
@@ -224,6 +239,8 @@ def record_league_match(winner, loser):
 
     if winner_id not in loser_stats["opponents"]:
         loser_stats["opponents"].append(winner_id)
+
+    return True
 
 
 def league_player_value(player_stats, category_key):
@@ -248,7 +265,7 @@ def get_league_winners(league):
         eligible_players = [
             (player_id, player_stats)
             for player_id, player_stats in players.items()
-            if player_id not in used_player_ids
+            if player_id not in used_player_ids and is_joined_league_player(player_stats)
         ]
         eligible_players = [
             (player_id, player_stats)
@@ -426,7 +443,7 @@ async def winvs(ctx, winner: discord.Member, loser: discord.Member):
     winner_record["wins"] += 1
     loser_record["losses"] += 1
     winner_record["points"] += POINTS_PER_WIN
-    record_league_match(winner, loser)
+    league_match_recorded = record_league_match(winner, loser)
 
     bounty_message = ""
     if loser_record["faction"] == bounty["faction"]:
@@ -437,6 +454,13 @@ async def winvs(ctx, winner: discord.Member, loser: discord.Member):
             f"for beating a member of faction {bounty['faction']}."
         )
 
+    league_message = ""
+    if get_active_league() is not None and not league_match_recorded:
+        league_message = (
+            "\nThis match did not count for league standings because both players "
+            "must join the league by choosing a faction first."
+        )
+
     save_records(records)
 
     await ctx.send(
@@ -445,6 +469,7 @@ async def winvs(ctx, winner: discord.Member, loser: discord.Member):
         f"({winner_record['points']} points)\n"
         f"{loser.display_name}: {loser_record['wins']}W - {loser_record['losses']}L"
         f"{bounty_message}"
+        f"{league_message}"
     )
 
 
@@ -512,10 +537,15 @@ async def league_status(ctx):
         await ctx.send("No league is currently running. Start one with `!beginleague`.")
         return
 
-    player_count = len(league.get("players", {}))
+    league_players = [
+        player_stats
+        for player_stats in league.get("players", {}).values()
+        if is_joined_league_player(player_stats)
+    ]
+    player_count = len(league_players)
     game_count = sum(
         player_stats.get("wins", 0)
-        for player_stats in league.get("players", {}).values()
+        for player_stats in league_players
     )
 
     await ctx.send(
@@ -560,6 +590,16 @@ async def choose_faction(ctx, *, faction_name: str):
     month_key = current_month_key()
 
     if old_faction == faction:
+        league = get_active_league()
+        if league is not None and not is_league_player(league, ctx.author):
+            get_league_player(league, ctx.author)
+            save_records(records)
+            await ctx.send(
+                f"{ctx.author.mention}, you are already in faction {faction} "
+                "and are now joined to the current league."
+            )
+            return
+
         await ctx.send(f"{ctx.author.mention}, you are already in faction {faction}.")
         return
 
@@ -568,6 +608,9 @@ async def choose_faction(ctx, *, faction_name: str):
         player_record["points"] = 0
         player_record["faction"] = faction
         player_record["faction_month"] = month_key
+        league = get_active_league()
+        if league is not None:
+            get_league_player(league, ctx.author)
         save_records(records)
         await ctx.send(
             f"{ctx.author.mention} changed from {old_faction} to {faction} "
@@ -577,6 +620,9 @@ async def choose_faction(ctx, *, faction_name: str):
 
     player_record["faction"] = faction
     player_record["faction_month"] = month_key
+    league = get_active_league()
+    if league is not None:
+        get_league_player(league, ctx.author)
     save_records(records)
     await ctx.send(f"{ctx.author.mention} joined faction {faction}.")
 
